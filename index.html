@@ -3,156 +3,118 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Memora — Remember what matters</title>
+<title>Đếm Tiền — Voice Cash Counter</title>
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <header class="topbar">
   <div class="brand">
-    <span class="logo">🧠</span>
+    <span class="logo">💵</span>
     <div>
-      <h1>Memora</h1>
-      <p class="tagline">Add it. Get quizzed. Watch it stick.</p>
+      <h1>Đếm Tiền</h1>
+      <p class="tagline">Count your VND notes by voice, one denomination at a time.</p>
     </div>
   </div>
   <nav class="tabs">
-    <button class="tab active" data-tab="items">📝 Items</button>
-    <button class="tab" data-tab="quiz">❓ Quiz <span id="due-badge" class="badge hidden">0</span></button>
-    <button class="tab" data-tab="report">📊 Report</button>
+    <button class="tab active" data-tab="count">🎙️ Count</button>
+    <button class="tab" data-tab="history">🕘 History</button>
     <button class="tab" data-tab="settings">⚙️</button>
   </nav>
 </header>
 
 <main>
-  <!-- ============ ITEMS TAB ============ -->
-  <section id="tab-items" class="panel active">
-    <form id="add-form" class="card add-card">
-      <h2>Add something to remember</h2>
-      <label for="q-input">Question / Prompt</label>
-      <input id="q-input" type="text" placeholder="e.g. What is the capital of Australia?" required maxlength="300" autocomplete="off">
-      <label for="a-input">Answer / The thing to remember</label>
-      <textarea id="a-input" placeholder="e.g. Canberra" required maxlength="1000" rows="2"></textarea>
-      <label for="tag-input">Tag <span class="muted">(optional)</span></label>
-      <input id="tag-input" type="text" placeholder="e.g. geography, work, spanish" maxlength="40" autocomplete="off">
-      <button type="submit" class="btn primary">+ Add to memory</button>
-    </form>
+  <!-- ============ COUNT TAB ============ -->
+  <section id="tab-count" class="panel active">
 
     <div class="card">
-      <div class="row spread">
-        <h2>Your items <span id="item-count" class="muted"></span></h2>
-        <input id="search-input" type="search" placeholder="Search…" class="search">
-      </div>
-      <ul id="item-list" class="item-list"></ul>
-      <p id="empty-items" class="empty hidden">Nothing here yet. Add your first item above 👆</p>
-    </div>
-  </section>
-
-  <!-- ============ QUIZ TAB ============ -->
-  <section id="tab-quiz" class="panel">
-    <div id="quiz-idle" class="card center-card">
-      <div class="big-emoji">🎉</div>
-      <h2 id="quiz-idle-title">All caught up!</h2>
-      <p id="quiz-idle-sub" class="muted">No questions due right now. Memora will ping you when it's time to review.</p>
-      <p id="next-due-info" class="muted small"></p>
-      <button id="practice-btn" class="btn ghost hidden">Practice anyway (review ahead of schedule)</button>
+      <div id="denom-strip" class="denom-strip"></div>
     </div>
 
-    <div id="quiz-card" class="card quiz-card hidden">
-      <div class="row spread small muted">
-        <span id="quiz-progress"></span>
-        <span id="quiz-tag"></span>
-      </div>
-      <h2 id="quiz-question" class="quiz-question"></h2>
-      <button id="reveal-btn" class="btn primary big">Reveal answer</button>
-      <div id="answer-zone" class="hidden">
-        <div class="answer-box" id="quiz-answer"></div>
-        <p class="grade-prompt">How did you do?</p>
-        <div class="grade-row">
-          <button class="btn grade missed" data-grade="0">✗ Missed it</button>
-          <button class="btn grade almost" data-grade="1">~ Almost</button>
-          <button class="btn grade got" data-grade="2">✓ Got it</button>
+    <!-- ---- active counting card ---- -->
+    <div id="counting-card" class="card center-card">
+      <p class="muted small">Denomination <span id="step-progress"></span></p>
+      <div id="current-denom" class="current-denom">500.000 ₫</div>
+      <p class="muted">How many notes of this value do you have?</p>
+
+      <button id="mic-btn" class="btn primary big mic-btn">🎤 Start listening</button>
+      <p id="mic-status" class="muted small mic-status"></p>
+      <p id="live-transcript" class="live-transcript"></p>
+
+      <div class="manual-entry">
+        <label for="manual-count">Or type the count</label>
+        <div class="row">
+          <input id="manual-count" type="number" inputmode="numeric" min="0" step="1" placeholder="e.g. 15">
+          <button id="manual-set-btn" class="btn">Set</button>
         </div>
       </div>
     </div>
 
-    <div id="quiz-done" class="card center-card hidden">
-      <div class="big-emoji">✅</div>
-      <h2>Session complete</h2>
-      <p id="session-summary" class="muted"></p>
-      <button id="back-to-idle" class="btn ghost">Done</button>
+    <!-- ---- confirm captured count ---- -->
+    <div id="confirm-card" class="card center-card hidden">
+      <p class="muted small">Denomination <span id="confirm-progress"></span></p>
+      <div id="confirm-denom" class="current-denom small-denom"></div>
+      <p class="muted">Did you say...</p>
+      <div id="confirm-count" class="confirm-count"></div>
+      <div id="confirm-subtotal" class="muted"></div>
+
+      <div class="grade-row confirm-actions">
+        <button id="redo-btn" class="btn grade missed">✗ No, redo</button>
+        <button id="confirm-btn" class="btn grade got">✓ Yes, next</button>
+      </div>
+      <p class="muted small">Or just say "yes" / "no", or say a different number to correct it.</p>
+    </div>
+
+    <div class="row spread stop-row">
+      <button id="restart-btn" class="btn ghost">🔄 Restart count</button>
+      <button id="stop-btn" class="btn danger">⏹ Stop &amp; show result</button>
+    </div>
+
+    <!-- ---- results ---- -->
+    <div id="results-card" class="card hidden">
+      <h2>Count complete</h2>
+      <table class="result-table">
+        <thead><tr><th>Denomination</th><th>Notes</th><th>Subtotal</th></tr></thead>
+        <tbody id="result-body"></tbody>
+      </table>
+      <div class="grand-total">
+        <span>Total</span>
+        <span id="grand-total">0 ₫</span>
+      </div>
+      <div class="row">
+        <input id="save-name" type="text" placeholder="Name this count (optional)" maxlength="60">
+        <button id="save-btn" class="btn primary">💾 Save</button>
+        <button id="copy-btn" class="btn ghost">📋 Copy summary</button>
+      </div>
+      <button id="new-count-btn" class="btn big">🔄 Start a new count</button>
     </div>
   </section>
 
-  <!-- ============ REPORT TAB ============ -->
-  <section id="tab-report" class="panel">
-    <div class="stat-grid">
-      <div class="card stat"><div class="stat-num" id="stat-items">0</div><div class="stat-label">items tracked</div></div>
-      <div class="card stat"><div class="stat-num" id="stat-reviews">0</div><div class="stat-label">total reviews</div></div>
-      <div class="card stat"><div class="stat-num" id="stat-accuracy">–</div><div class="stat-label">overall accuracy</div></div>
-      <div class="card stat"><div class="stat-num" id="stat-streak">0</div><div class="stat-label">day streak 🔥</div></div>
-    </div>
-
+  <!-- ============ HISTORY TAB ============ -->
+  <section id="tab-history" class="panel">
     <div class="card">
-      <h2>Memory strength map</h2>
-      <p class="muted small">Each tile is one item. Greener &amp; brighter = stronger memory. Click a tile for details.</p>
-      <div id="strength-map" class="strength-map"></div>
-      <div class="legend">
-        <span class="muted small">weak</span>
-        <span class="legend-swatch" style="background:var(--s0)"></span>
-        <span class="legend-swatch" style="background:var(--s1)"></span>
-        <span class="legend-swatch" style="background:var(--s2)"></span>
-        <span class="legend-swatch" style="background:var(--s3)"></span>
-        <span class="legend-swatch" style="background:var(--s4)"></span>
-        <span class="muted small">strong</span>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>Ranking — weakest first</h2>
-      <p class="muted small">These need the most attention.</p>
-      <ol id="ranking-list" class="ranking-list"></ol>
-    </div>
-
-    <div class="card">
-      <h2>Review activity <span class="muted small">(last 12 weeks)</span></h2>
-      <div id="activity-heatmap" class="activity-heatmap"></div>
-      <div class="legend">
-        <span class="muted small">less</span>
-        <span class="legend-swatch" style="background:var(--a0)"></span>
-        <span class="legend-swatch" style="background:var(--a1)"></span>
-        <span class="legend-swatch" style="background:var(--a2)"></span>
-        <span class="legend-swatch" style="background:var(--a3)"></span>
-        <span class="legend-swatch" style="background:var(--a4)"></span>
-        <span class="muted small">more</span>
-      </div>
+      <h2>Saved counts</h2>
+      <ul id="history-list" class="history-list"></ul>
+      <p id="empty-history" class="empty hidden">No saved counts yet.</p>
     </div>
   </section>
 
   <!-- ============ SETTINGS TAB ============ -->
   <section id="tab-settings" class="panel">
     <div class="card">
-      <h2>Reminders</h2>
-      <label for="notify-toggle" class="row toggle-row">
-        <span>Browser notifications when reviews are due</span>
-        <input type="checkbox" id="notify-toggle">
-      </label>
-      <label for="check-interval">Check for due items every</label>
-      <select id="check-interval">
-        <option value="5">5 minutes</option>
-        <option value="15" selected>15 minutes</option>
-        <option value="30">30 minutes</option>
-        <option value="60">1 hour</option>
+      <h2>Voice recognition</h2>
+      <label for="lang-select">Language you'll speak numbers in</label>
+      <select id="lang-select">
+        <option value="vi-VN">Tiếng Việt (vi-VN)</option>
+        <option value="en-US">English (en-US)</option>
       </select>
-      <p class="muted small">Keep this tab open (even in the background) for reminders to fire. New items are first asked ~10 minutes after you add them, then at growing intervals as you master them: 1h → 4h → 12h → 1 day → 3 days → 1 week.</p>
+      <p id="speech-support-warning" class="muted small hidden">
+        ⚠️ Your browser doesn't support voice recognition (Web Speech API). You can still count using the
+        manual number entry below the mic button.
+      </p>
     </div>
     <div class="card">
       <h2>Data</h2>
-      <div class="row">
-        <button id="export-btn" class="btn ghost">Export JSON</button>
-        <button id="import-btn" class="btn ghost">Import JSON</button>
-        <input type="file" id="import-file" accept=".json" class="hidden">
-        <button id="wipe-btn" class="btn danger">Delete all data</button>
-      </div>
+      <button id="wipe-btn" class="btn danger">Delete all saved counts</button>
       <p class="muted small">Everything is stored locally in your browser — nothing leaves your device.</p>
     </div>
   </section>
@@ -160,14 +122,20 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<!-- Item detail modal -->
+<!-- History detail modal -->
 <div id="modal-backdrop" class="modal-backdrop hidden">
   <div class="modal card">
     <button id="modal-close" class="modal-close">✕</button>
-    <h2 id="modal-q"></h2>
-    <p id="modal-a" class="answer-box"></p>
-    <div id="modal-stats" class="modal-stats"></div>
-    <div class="modal-history" id="modal-history"></div>
+    <h2 id="modal-title"></h2>
+    <p id="modal-date" class="muted small"></p>
+    <table class="result-table">
+      <thead><tr><th>Denomination</th><th>Notes</th><th>Subtotal</th></tr></thead>
+      <tbody id="modal-body"></tbody>
+    </table>
+    <div class="grand-total">
+      <span>Total</span>
+      <span id="modal-total"></span>
+    </div>
   </div>
 </div>
 

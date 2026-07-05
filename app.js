@@ -1,39 +1,42 @@
-/* Memora — local-first memory consolidation app.
- * Data model: items are scheduled with a Leitner-style ladder; grading a
- * review moves the item up (got it), holds it (almost), or resets it (missed).
+/* Đếm Tiền — voice-driven VND cash counter.
+ * Walks through banknote denominations largest to smallest; for each one the
+ * user speaks (or types) how many notes they have, confirms it, then the app
+ * advances to the next denomination. Stopping early still shows a result for
+ * whatever was confirmed so far.
  */
 (() => {
 "use strict";
 
-const STORAGE_KEY = "memora.v1";
-const MIN = 60 * 1000;
+const STORAGE_KEY = "demtien.v1";
 
-// Review intervals per Leitner box, in minutes: 10m, 1h, 4h, 12h, 1d, 3d, 7d
-const BOX_INTERVALS = [10, 60, 240, 720, 1440, 4320, 10080];
-const MAX_BOX = BOX_INTERVALS.length - 1;
+// Largest to smallest, VND paper notes currently in circulation.
+const DENOMINATIONS = [500000, 200000, 100000, 50000, 20000, 10000, 5000, 2000, 1000];
+const SHORT_LABEL = {
+  500000: "500k", 200000: "200k", 100000: "100k", 50000: "50k", 20000: "20k",
+  10000: "10k", 5000: "5k", 2000: "2k", 1000: "1k",
+};
 
-const GRADE = { MISSED: 0, ALMOST: 1, GOT: 2 };
+const STOP_WORDS = ["stop", "done", "finish", "end", "dừng", "xong", "kết thúc", "hoàn tất", "hoàn thành"];
+const CONFIRM_WORDS = ["yes", "correct", "confirm", "next", "right", "yeah", "yep", "ok", "okay", "đúng", "vâng", "ừ"];
+const REDO_WORDS = ["no", "wrong", "redo", "retry", "again", "nope", "sai", "lại"];
 
 // ---------- state ----------
 
 let state = load();
-let session = null; // { queue: [ids], total, results: {got, almost, missed} }
-let reminderTimer = null;
 
 function load() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (parsed && Array.isArray(parsed.items)) {
-        return {
-          items: parsed.items,
-          settings: { notify: false, checkMins: 15, ...parsed.settings },
-        };
-      }
+      return {
+        history: Array.isArray(parsed.history) ? parsed.history : [],
+        settings: { lang: "vi-VN", ...parsed.settings },
+        draft: parsed.draft && typeof parsed.draft === "object" ? parsed.draft : null,
+      };
     }
   } catch (e) { /* corrupted storage -> start fresh */ }
-  return { items: [], settings: { notify: false, checkMins: 15 } };
+  return { history: [], settings: { lang: "vi-VN" }, draft: null };
 }
 
 function save() {
@@ -44,51 +47,84 @@ function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
-// ---------- scheduling & scoring ----------
-
-function dueItems(now = Date.now()) {
-  return state.items.filter((it) => it.due <= now);
+function newSession() {
+  state.draft = { idx: 0, counts: {}, pending: null, finished: false };
+  save();
 }
 
-function applyGrade(item, grade) {
-  const now = Date.now();
-  item.history.push({ t: now, g: grade });
-  if (grade === GRADE.GOT) item.box = Math.min(item.box + 1, MAX_BOX);
-  else if (grade === GRADE.MISSED) item.box = 0;
-  // ALMOST keeps the current box
-  item.due = now + BOX_INTERVALS[item.box] * MIN;
+if (!state.draft) newSession();
+
+function computeTotal(counts) {
+  return DENOMINATIONS.reduce((sum, v) => sum + (counts[v] || 0) * v, 0);
 }
 
-/* Memory strength in [0,1]: exponentially weighted recall history (recent
- * reviews count more) blended with ladder progress. Unreviewed items = 0. */
-function strength(item) {
-  if (item.history.length === 0) return 0;
-  let num = 0, den = 0, w = 1;
-  for (let i = item.history.length - 1; i >= 0; i--) {
-    num += w * (item.history[i].g / 2);
-    den += w;
-    w *= 0.7;
+// ---------- number parsing (digits, English words, Vietnamese words) ----------
+
+const EN_ONES = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
+  ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
+  sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19,
+};
+const EN_TENS = { twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90 };
+
+function wordsToNumberEN(tokens) {
+  let total = 0, current = 0, found = false;
+  for (const tok of tokens) {
+    if (tok === "and") continue;
+    if (Object.prototype.hasOwnProperty.call(EN_ONES, tok)) { current += EN_ONES[tok]; found = true; }
+    else if (Object.prototype.hasOwnProperty.call(EN_TENS, tok)) { current += EN_TENS[tok]; found = true; }
+    else if (tok === "hundred") { current = (current || 1) * 100; found = true; }
+    else if (tok === "thousand") { total += (current || 1) * 1000; current = 0; found = true; }
   }
-  const recall = num / den;
-  const progress = item.box / MAX_BOX;
-  return 0.7 * recall + 0.3 * progress;
+  if (!found) return null;
+  return total + current;
 }
 
-function strengthBucket(s, reviewed) {
-  if (!reviewed) return -1; // "new", shown grey
-  if (s < 0.2) return 0;
-  if (s < 0.4) return 1;
-  if (s < 0.6) return 2;
-  if (s < 0.8) return 3;
-  return 4;
+// Vietnamese digit words, including the special forms used after mươi/mười.
+const VI_DIGIT = {
+  "không": 0, "một": 1, "mốt": 1, "hai": 2, "ba": 3, "bốn": 4, "tư": 4,
+  "năm": 5, "lăm": 5, "nhăm": 5, "sáu": 6, "bảy": 7, "bẩy": 7, "tám": 8, "chín": 9,
+};
+
+function wordsToNumberVI(tokens) {
+  let segment = 0, pendingDigit = null, found = false;
+  for (const tok of tokens) {
+    if (Object.prototype.hasOwnProperty.call(VI_DIGIT, tok)) {
+      pendingDigit = VI_DIGIT[tok];
+      found = true;
+    } else if (tok === "trăm") {
+      segment += (pendingDigit ?? 1) * 100;
+      pendingDigit = null;
+      found = true;
+    } else if (tok === "mười") {
+      segment += 10;
+      pendingDigit = null;
+      found = true;
+    } else if (tok === "mươi") {
+      segment += (pendingDigit ?? 1) * 10;
+      pendingDigit = null;
+      found = true;
+    } else if (tok === "linh" || tok === "lẻ") {
+      pendingDigit = null;
+    }
+  }
+  if (!found) return null;
+  return segment + (pendingDigit ?? 0);
 }
 
-const STRENGTH_VARS = ["--s0", "--s1", "--s2", "--s3", "--s4"];
+function parseCount(text) {
+  const digitMatch = text.match(/\d+/);
+  if (digitMatch) return parseInt(digitMatch[0], 10);
+  const tokens = text.normalize("NFC").replace(/[^\p{L}\s]/gu, "").split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return null;
+  const en = wordsToNumberEN(tokens);
+  if (en !== null) return en;
+  return wordsToNumberVI(tokens);
+}
 
-function strengthColor(item) {
-  const b = strengthBucket(strength(item), item.history.length > 0);
-  if (b === -1) return "var(--surface-2)";
-  return `var(${STRENGTH_VARS[b]})`;
+function matchesAny(text, phrases) {
+  const tokens = text.split(/\s+/).filter(Boolean);
+  return phrases.some((p) => (p.includes(" ") ? text.includes(p) : tokens.includes(p)));
 }
 
 // ---------- DOM helpers ----------
@@ -108,23 +144,11 @@ function toast(msg) {
   t.textContent = msg;
   t.classList.remove("hidden");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.add("hidden"), 2600);
+  toastTimer = setTimeout(() => t.classList.add("hidden"), 3200);
 }
 
-function fmtAgo(ts) {
-  const d = Date.now() - ts;
-  if (d < MIN) return "just now";
-  if (d < 60 * MIN) return `${Math.floor(d / MIN)}m ago`;
-  if (d < 24 * 60 * MIN) return `${Math.floor(d / (60 * MIN))}h ago`;
-  return `${Math.floor(d / (24 * 60 * MIN))}d ago`;
-}
-
-function fmtIn(ts) {
-  const d = ts - Date.now();
-  if (d <= 0) return "now";
-  if (d < 60 * MIN) return `in ${Math.ceil(d / MIN)}m`;
-  if (d < 24 * 60 * MIN) return `in ${Math.ceil(d / (60 * MIN))}h`;
-  return `in ${Math.ceil(d / (24 * 60 * MIN))}d`;
+function fmtVND(n) {
+  return Math.round(n).toLocaleString("vi-VN") + " ₫";
 }
 
 // ---------- tabs ----------
@@ -134,336 +158,296 @@ document.querySelectorAll(".tab").forEach((btn) => {
 });
 
 function switchTab(name) {
-  document.querySelectorAll(".tab").forEach((b) =>
-    b.classList.toggle("active", b.dataset.tab === name));
-  document.querySelectorAll(".panel").forEach((p) =>
-    p.classList.toggle("active", p.id === "tab-" + name));
-  if (name === "items") renderItems();
-  if (name === "quiz") renderQuiz();
-  if (name === "report") renderReport();
+  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("active", p.id === "tab-" + name));
+  if (name === "count") renderCount();
+  if (name === "history") renderHistory();
 }
 
-// ---------- items tab ----------
+// ---------- speech recognition ----------
 
-$("#add-form").addEventListener("submit", (e) => {
-  e.preventDefault();
-  const q = $("#q-input").value.trim();
-  const a = $("#a-input").value.trim();
-  const tag = $("#tag-input").value.trim();
-  if (!q || !a) return;
-  state.items.push({
-    id: uid(),
-    q, a, tag,
-    createdAt: Date.now(),
-    box: 0,
-    due: Date.now() + BOX_INTERVALS[0] * MIN,
-    history: [],
-  });
-  save();
-  e.target.reset();
-  $("#q-input").focus();
-  toast("Added! First quiz in ~10 minutes.");
-  renderItems();
-  updateDueBadge();
-});
+function getRecognitionCtor() {
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
 
-$("#search-input").addEventListener("input", renderItems);
+let recognition = null;
+let listening = false;
 
-function renderItems() {
-  const list = $("#item-list");
-  list.innerHTML = "";
-  const filter = $("#search-input").value.trim().toLowerCase();
-  const items = state.items
-    .filter((it) => !filter || it.q.toLowerCase().includes(filter) ||
-      it.a.toLowerCase().includes(filter) || (it.tag || "").toLowerCase().includes(filter))
-    .slice()
-    .sort((a, b) => b.createdAt - a.createdAt);
+function updateMicUI() {
+  const btn = $("#mic-btn");
+  btn.textContent = listening ? "⏹ Stop listening" : "🎤 Start listening";
+  btn.classList.toggle("listening", listening);
+  $("#mic-status").textContent = listening ? "🎙 Listening… speak the count" : "";
+  if (!listening) $("#live-transcript").textContent = "";
+}
 
-  $("#item-count").textContent = state.items.length ? `(${state.items.length})` : "";
-  $("#empty-items").classList.toggle("hidden", state.items.length > 0);
+function startListening() {
+  const Ctor = getRecognitionCtor();
+  if (!Ctor) { toast("Voice recognition isn't supported in this browser — use the manual entry below."); return; }
+  recognition = new Ctor();
+  recognition.lang = state.settings.lang;
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.onresult = onRecognitionResult;
+  recognition.onerror = onRecognitionError;
+  recognition.onend = onRecognitionEnd;
+  try { recognition.start(); } catch (e) { /* already running */ }
+  listening = true;
+  updateMicUI();
+}
 
-  for (const it of items) {
-    const row = el("li", "item-row");
+function stopListening() {
+  listening = false;
+  if (recognition) { try { recognition.stop(); } catch (e) { /* ignore */ } }
+  updateMicUI();
+}
 
-    const dot = el("span", "strength-dot");
-    dot.style.background = strengthColor(it);
-    dot.title = it.history.length ? `strength ${Math.round(strength(it) * 100)}%` : "not reviewed yet";
+function toggleListening() {
+  if (listening) stopListening();
+  else startListening();
+}
 
-    const main = el("div", "item-main");
-    main.append(el("div", "item-q", it.q));
-    const meta = el("div", "item-meta",
-      `${it.history.length} review${it.history.length === 1 ? "" : "s"} · next ${fmtIn(it.due)}`);
-    main.append(meta);
-
-    row.append(dot, main);
-    if (it.tag) row.append(el("span", "tag-chip", it.tag));
-
-    const info = el("button", "icon-btn", "👁");
-    info.title = "View details";
-    info.addEventListener("click", () => openModal(it));
-
-    const del = el("button", "icon-btn", "🗑");
-    del.title = "Delete";
-    del.addEventListener("click", () => {
-      if (!confirm(`Delete "${it.q}"?`)) return;
-      state.items = state.items.filter((x) => x.id !== it.id);
-      save();
-      renderItems();
-      updateDueBadge();
-    });
-
-    row.append(info, del);
-    list.append(row);
+function onRecognitionEnd() {
+  if (!listening) return;
+  try { recognition.start(); } catch (e) {
+    setTimeout(() => { if (listening) { try { recognition.start(); } catch (e2) { /* ignore */ } } }, 250);
   }
 }
 
-// ---------- quiz tab ----------
-
-$("#practice-btn").addEventListener("click", () => startSession(true));
-$("#reveal-btn").addEventListener("click", () => {
-  $("#answer-zone").classList.remove("hidden");
-  $("#reveal-btn").classList.add("hidden");
-});
-document.querySelectorAll(".btn.grade").forEach((btn) => {
-  btn.addEventListener("click", () => gradeCurrent(Number(btn.dataset.grade)));
-});
-$("#back-to-idle").addEventListener("click", renderQuiz);
-
-function renderQuiz() {
-  $("#quiz-done").classList.add("hidden");
-  const due = dueItems();
-  if (session && session.queue.length > 0) {
-    showQuestion();
-    return;
+function onRecognitionError(e) {
+  if (e.error === "no-speech" || e.error === "aborted") return; // benign, onend restarts
+  if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+    toast("Microphone permission denied.");
+    listening = false;
+    updateMicUI();
   }
-  session = null;
-  if (due.length > 0) {
-    startSession(false);
-    return;
+}
+
+function onRecognitionResult(event) {
+  let interim = "";
+  for (let i = event.resultIndex; i < event.results.length; i++) {
+    const res = event.results[i];
+    const transcript = res[0].transcript;
+    if (res.isFinal) {
+      $("#live-transcript").textContent = "";
+      handleUtterance(transcript.toLowerCase().trim());
+    } else {
+      interim += transcript;
+    }
   }
-  // idle screen
-  $("#quiz-card").classList.add("hidden");
-  $("#quiz-idle").classList.remove("hidden");
-  const hasItems = state.items.length > 0;
-  $("#quiz-idle-title").textContent = hasItems ? "All caught up!" : "Nothing to quiz yet";
-  $("#quiz-idle-sub").textContent = hasItems
-    ? "No questions due right now. Memora will ping you when it's time to review."
-    : "Add a few items first, then come back here.";
-  $("#practice-btn").classList.toggle("hidden", !hasItems);
-  if (hasItems) {
-    const next = Math.min(...state.items.map((it) => it.due));
-    $("#next-due-info").textContent = `Next question due ${fmtIn(next)}.`;
+  if (interim) $("#live-transcript").textContent = interim;
+}
+
+function handleUtterance(text) {
+  const d = state.draft;
+  if (!text || d.finished) return;
+
+  if (d.pending === null) {
+    if (matchesAny(text, STOP_WORDS)) { finishSession(); toast("Stopped."); return; }
+    const n = parseCount(text);
+    if (n === null || !isFinite(n) || n < 0) {
+      toast(`Didn't catch a number ("${text}") — try again or type it below.`);
+      return;
+    }
+    d.pending = Math.round(n);
+    save();
+    renderCount();
   } else {
-    $("#next-due-info").textContent = "";
+    if (matchesAny(text, CONFIRM_WORDS)) { commitPending(); return; }
+    if (matchesAny(text, REDO_WORDS)) { redoPending(); return; }
+    if (matchesAny(text, STOP_WORDS)) { finishSession(); toast("Stopped."); return; }
+    const n = parseCount(text);
+    if (n !== null) {
+      d.pending = Math.round(n);
+      save();
+      renderCount();
+      toast('Updated — say "yes" to confirm.');
+      return;
+    }
+    toast('Say "yes", "no", or a corrected number.');
   }
 }
 
-function startSession(practice) {
-  let pool = dueItems();
-  if (practice && pool.length === 0) {
-    // review ahead of schedule: take the soonest-due / weakest items
-    pool = state.items.slice()
-      .sort((a, b) => strength(a) - strength(b) || a.due - b.due)
-      .slice(0, 10);
-  }
-  if (pool.length === 0) { renderQuiz(); return; }
-  // weakest first within the session
-  pool.sort((a, b) => strength(a) - strength(b));
-  session = {
-    queue: pool.map((it) => it.id),
-    total: pool.length,
-    practice,
-    results: { got: 0, almost: 0, missed: 0 },
-  };
-  showQuestion();
-}
+// ---------- count tab ----------
 
-function currentItem() {
-  if (!session || session.queue.length === 0) return null;
-  return state.items.find((it) => it.id === session.queue[0]) || null;
-}
-
-function showQuestion() {
-  const it = currentItem();
-  if (!it) { finishSession(); return; }
-  $("#quiz-idle").classList.add("hidden");
-  $("#quiz-done").classList.add("hidden");
-  $("#quiz-card").classList.remove("hidden");
-  $("#answer-zone").classList.add("hidden");
-  $("#reveal-btn").classList.remove("hidden");
-  $("#quiz-progress").textContent =
-    `Question ${session.total - session.queue.length + 1} of ${session.total}`;
-  $("#quiz-tag").textContent = it.tag || "";
-  $("#quiz-question").textContent = it.q;
-  $("#quiz-answer").textContent = it.a;
-}
-
-function gradeCurrent(grade) {
-  const it = currentItem();
-  if (!it) return;
-  applyGrade(it, grade);
-  if (grade === GRADE.GOT) session.results.got++;
-  else if (grade === GRADE.ALMOST) session.results.almost++;
-  else session.results.missed++;
-  session.queue.shift();
+function commitPending() {
+  const d = state.draft;
+  if (d.pending === null) return;
+  d.counts[DENOMINATIONS[d.idx]] = d.pending;
+  d.pending = null;
+  d.idx++;
+  if (d.idx >= DENOMINATIONS.length) d.finished = true;
   save();
-  updateDueBadge();
-  if (session.queue.length === 0) finishSession();
-  else showQuestion();
+  renderCount();
+}
+
+function redoPending() {
+  const d = state.draft;
+  d.pending = null;
+  save();
+  renderCount();
 }
 
 function finishSession() {
-  if (!session) { renderQuiz(); return; }
-  const r = session.results;
-  const answered = r.got + r.almost + r.missed;
-  session = null;
-  if (answered === 0) { renderQuiz(); return; }
-  $("#quiz-card").classList.add("hidden");
-  $("#quiz-idle").classList.add("hidden");
-  $("#quiz-done").classList.remove("hidden");
-  $("#session-summary").textContent =
-    `${answered} reviewed — ✓ ${r.got} got it, ~ ${r.almost} almost, ✗ ${r.missed} missed.`;
+  const d = state.draft;
+  d.pending = null;
+  d.finished = true;
+  save();
+  renderCount();
 }
 
-// ---------- report tab ----------
-
-function renderReport() {
-  const items = state.items;
-  const allReviews = items.flatMap((it) => it.history);
-
-  $("#stat-items").textContent = items.length;
-  $("#stat-reviews").textContent = allReviews.length;
-  const correctish = allReviews.filter((h) => h.g === GRADE.GOT).length +
-    0.5 * allReviews.filter((h) => h.g === GRADE.ALMOST).length;
-  $("#stat-accuracy").textContent = allReviews.length
-    ? Math.round((correctish / allReviews.length) * 100) + "%" : "–";
-  $("#stat-streak").textContent = computeStreak(allReviews);
-
-  renderStrengthMap(items);
-  renderRanking(items);
-  renderActivityHeatmap(allReviews);
+function submitManual() {
+  const input = $("#manual-count");
+  const n = Number(input.value);
+  if (!Number.isFinite(n) || n < 0) { toast("Enter a valid count (0 or more)."); return; }
+  state.draft.pending = Math.round(n);
+  save();
+  input.value = "";
+  renderCount();
 }
 
-function dayKey(ts) {
-  const d = new Date(ts);
-  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
-}
-
-function computeStreak(reviews) {
-  const days = new Set(reviews.map((h) => dayKey(h.t)));
-  let streak = 0;
-  const cursor = new Date();
-  // today counts if reviewed; otherwise streak may still be alive from yesterday
-  if (!days.has(dayKey(cursor.getTime()))) cursor.setDate(cursor.getDate() - 1);
-  while (days.has(dayKey(cursor.getTime()))) {
-    streak++;
-    cursor.setDate(cursor.getDate() - 1);
-  }
-  return streak;
-}
-
-function renderStrengthMap(items) {
-  const map = $("#strength-map");
-  map.innerHTML = "";
-  if (items.length === 0) {
-    map.append(el("p", "empty", "Add items to see your memory map."));
-    return;
-  }
-  for (const it of items) {
-    const tile = el("div", "strength-tile");
-    tile.style.background = strengthColor(it);
-    const s = Math.round(strength(it) * 100);
-    tile.textContent = it.history.length ? s : "new";
-    tile.title = it.q;
-    tile.addEventListener("click", () => openModal(it));
-    map.append(tile);
-  }
-}
-
-function renderRanking(items) {
-  const list = $("#ranking-list");
-  list.innerHTML = "";
-  const reviewed = items.filter((it) => it.history.length > 0);
-  if (reviewed.length === 0) {
-    list.append(el("p", "empty", "Complete some quizzes to build your ranking."));
-    return;
-  }
-  const ranked = reviewed.slice().sort((a, b) => strength(a) - strength(b)).slice(0, 10);
-  ranked.forEach((it, i) => {
-    const s = strength(it);
-    const row = el("li", "rank-row");
-    row.append(el("span", "rank-num", String(i + 1)));
-
-    const barWrap = el("div", "rank-bar-wrap");
-    const bar = el("div", "rank-bar");
-    bar.style.width = Math.max(4, Math.round(s * 100)) + "%";
-    bar.style.background = strengthColor(it);
-    barWrap.append(bar);
-    row.append(barWrap);
-
-    const q = el("span", "rank-q", it.q);
-    q.title = it.q;
-    q.style.cursor = "pointer";
-    q.addEventListener("click", () => openModal(it));
-    row.append(q);
-
-    row.append(el("span", "rank-pct", Math.round(s * 100) + "% strong"));
-    list.append(row);
+function renderDenomStrip() {
+  const d = state.draft;
+  const strip = $("#denom-strip");
+  strip.innerHTML = "";
+  DENOMINATIONS.forEach((v, i) => {
+    const done = Object.prototype.hasOwnProperty.call(d.counts, v);
+    const isCurrent = !d.finished && i === d.idx;
+    const chip = el("div", "denom-chip" + (isCurrent ? " current" : done ? " done" : ""));
+    chip.append(el("span", "", SHORT_LABEL[v]));
+    if (done) chip.append(el("span", "chip-count", `${d.counts[v]}×`));
+    strip.append(chip);
   });
 }
 
-function renderActivityHeatmap(reviews) {
-  const wrap = $("#activity-heatmap");
-  wrap.innerHTML = "";
-  const counts = new Map();
-  for (const h of reviews) {
-    const k = dayKey(h.t);
-    counts.set(k, (counts.get(k) || 0) + 1);
+function renderCount() {
+  const d = state.draft;
+  renderDenomStrip();
+
+  $("#counting-card").classList.add("hidden");
+  $("#confirm-card").classList.add("hidden");
+  $("#results-card").classList.add("hidden");
+
+  if (d.finished) {
+    $("#results-card").classList.remove("hidden");
+    renderResults();
+    return;
   }
-  const weeks = 12;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  // start on the Sunday `weeks` weeks back so columns align to weekdays
-  const start = new Date(today);
-  start.setDate(start.getDate() - (weeks * 7 - 1) - today.getDay());
-  const cursor = new Date(start);
-  while (cursor <= today) {
-    const c = counts.get(dayKey(cursor.getTime())) || 0;
-    const cell = el("div", "activity-cell");
-    const lvl = c === 0 ? 0 : c <= 2 ? 1 : c <= 5 ? 2 : c <= 10 ? 3 : 4;
-    cell.style.background = `var(--a${lvl})`;
-    cell.title = `${cursor.toDateString()}: ${c} review${c === 1 ? "" : "s"}`;
-    wrap.append(cell);
-    cursor.setDate(cursor.getDate() + 1);
+
+  const denom = DENOMINATIONS[d.idx];
+  if (d.pending !== null) {
+    $("#confirm-card").classList.remove("hidden");
+    $("#confirm-progress").textContent = `${d.idx + 1} of ${DENOMINATIONS.length}`;
+    $("#confirm-denom").textContent = fmtVND(denom);
+    $("#confirm-count").textContent = `${d.pending} note${d.pending === 1 ? "" : "s"}`;
+    $("#confirm-subtotal").textContent = `= ${fmtVND(d.pending * denom)}`;
+  } else {
+    $("#counting-card").classList.remove("hidden");
+    $("#step-progress").textContent = `${d.idx + 1} of ${DENOMINATIONS.length}`;
+    $("#current-denom").textContent = fmtVND(denom);
   }
 }
 
-// ---------- item detail modal ----------
+function renderResults() {
+  const d = state.draft;
+  const body = $("#result-body");
+  body.innerHTML = "";
+  DENOMINATIONS.forEach((v) => {
+    const count = d.counts[v] || 0;
+    const tr = document.createElement("tr");
+    tr.append(el("td", "", fmtVND(v)), el("td", "", String(count)), el("td", "", fmtVND(count * v)));
+    body.append(tr);
+  });
+  $("#grand-total").textContent = fmtVND(computeTotal(d.counts));
+}
 
-function openModal(item) {
-  $("#modal-q").textContent = item.q;
-  $("#modal-a").textContent = item.a;
-  const s = Math.round(strength(item) * 100);
-  const stats = $("#modal-stats");
-  stats.innerHTML = "";
-  stats.append(
-    el("span", "", `💪 strength: ${item.history.length ? s + "%" : "new"}`),
-    el("span", "", `📦 level ${item.box + 1}/${MAX_BOX + 1}`),
-    el("span", "", `🔁 ${item.history.length} reviews`),
-    el("span", "", `⏰ next ${fmtIn(item.due)}`),
-  );
-  const hist = $("#modal-history");
-  hist.innerHTML = "";
-  if (item.history.length) {
-    hist.append(el("span", "small muted", "history: "));
-    for (const h of item.history) {
-      const dot = el("span", "history-dot");
-      dot.style.background =
-        h.g === GRADE.GOT ? "var(--green)" : h.g === GRADE.ALMOST ? "var(--amber)" : "var(--danger)";
-      dot.title = `${new Date(h.t).toLocaleString()} — ${["missed", "almost", "got it"][h.g]}`;
-      hist.append(dot);
-    }
+function summaryText() {
+  const d = state.draft;
+  const lines = DENOMINATIONS
+    .filter((v) => d.counts[v])
+    .map((v) => `${fmtVND(v)} × ${d.counts[v]} = ${fmtVND(d.counts[v] * v)}`);
+  lines.push(`Total: ${fmtVND(computeTotal(d.counts))}`);
+  return lines.join("\n");
+}
+
+$("#mic-btn").addEventListener("click", toggleListening);
+$("#manual-set-btn").addEventListener("click", submitManual);
+$("#manual-count").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); submitManual(); }
+});
+$("#confirm-btn").addEventListener("click", commitPending);
+$("#redo-btn").addEventListener("click", redoPending);
+$("#restart-btn").addEventListener("click", () => {
+  if (!confirm("Restart the count from the beginning? Unsaved progress will be lost.")) return;
+  newSession();
+  renderCount();
+});
+$("#stop-btn").addEventListener("click", finishSession);
+
+$("#save-btn").addEventListener("click", () => {
+  const d = state.draft;
+  const total = computeTotal(d.counts);
+  const name = $("#save-name").value.trim() || new Date().toLocaleString();
+  state.history.unshift({ id: uid(), name, timestamp: Date.now(), counts: { ...d.counts }, total });
+  save();
+  $("#save-name").value = "";
+  toast("Saved to history.");
+});
+
+$("#copy-btn").addEventListener("click", () => {
+  navigator.clipboard.writeText(summaryText())
+    .then(() => toast("Summary copied."))
+    .catch(() => toast("Couldn't copy — clipboard unavailable."));
+});
+
+$("#new-count-btn").addEventListener("click", () => {
+  newSession();
+  renderCount();
+});
+
+// ---------- history tab ----------
+
+function renderHistory() {
+  const list = $("#history-list");
+  list.innerHTML = "";
+  $("#empty-history").classList.toggle("hidden", state.history.length > 0);
+
+  for (const entry of state.history) {
+    const row = el("li", "history-row");
+    const main = el("div", "history-main");
+    main.append(el("div", "history-name", entry.name));
+    const noteCount = DENOMINATIONS.reduce((s, v) => s + (entry.counts[v] || 0), 0);
+    main.append(el("div", "history-meta", `${new Date(entry.timestamp).toLocaleString()} · ${noteCount} notes`));
+    row.append(main, el("span", "history-amount", fmtVND(entry.total)));
+
+    const del = el("button", "icon-btn", "🗑");
+    del.title = "Delete";
+    del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (!confirm(`Delete "${entry.name}"?`)) return;
+      state.history = state.history.filter((x) => x.id !== entry.id);
+      save();
+      renderHistory();
+    });
+    row.append(del);
+
+    row.addEventListener("click", () => openModal(entry));
+    list.append(row);
   }
+}
+
+function openModal(entry) {
+  $("#modal-title").textContent = entry.name;
+  $("#modal-date").textContent = new Date(entry.timestamp).toLocaleString();
+  const body = $("#modal-body");
+  body.innerHTML = "";
+  DENOMINATIONS.forEach((v) => {
+    const count = entry.counts[v] || 0;
+    const tr = document.createElement("tr");
+    tr.append(el("td", "", fmtVND(v)), el("td", "", String(count)), el("td", "", fmtVND(count * v)));
+    body.append(tr);
+  });
+  $("#modal-total").textContent = fmtVND(entry.total);
   $("#modal-backdrop").classList.remove("hidden");
 }
 
@@ -472,124 +456,31 @@ $("#modal-backdrop").addEventListener("click", (e) => {
   if (e.target === $("#modal-backdrop")) $("#modal-backdrop").classList.add("hidden");
 });
 
-// ---------- reminders & notifications ----------
+// ---------- settings tab ----------
 
-function updateDueBadge() {
-  const n = dueItems().length;
-  const badge = $("#due-badge");
-  badge.textContent = n;
-  badge.classList.toggle("hidden", n === 0);
-  document.title = n > 0 ? `(${n}) Memora` : "Memora";
-}
-
-function checkReminders() {
-  updateDueBadge();
-  const n = dueItems().length;
-  if (n > 0 && state.settings.notify && "Notification" in window &&
-      Notification.permission === "granted" && document.hidden) {
-    const note = new Notification("Memora — time to review! 🧠", {
-      body: `${n} question${n === 1 ? "" : "s"} waiting for you.`,
-      tag: "memora-due", // collapse repeats into one notification
-    });
-    note.onclick = () => { window.focus(); switchTab("quiz"); };
-  }
-}
-
-function startReminderLoop() {
-  clearInterval(reminderTimer);
-  reminderTimer = setInterval(checkReminders, state.settings.checkMins * MIN);
-  // lightweight badge refresh so "due" counts stay current while the app is open
-  setInterval(updateDueBadge, MIN);
-}
-
-// ---------- settings ----------
-
-$("#notify-toggle").checked = state.settings.notify;
-$("#check-interval").value = String(state.settings.checkMins);
-
-$("#notify-toggle").addEventListener("change", async (e) => {
-  if (e.target.checked) {
-    if (!("Notification" in window)) {
-      toast("Notifications aren't supported in this browser.");
-      e.target.checked = false;
-      return;
-    }
-    const perm = await Notification.requestPermission();
-    if (perm !== "granted") {
-      toast("Permission denied — enable notifications in browser settings.");
-      e.target.checked = false;
-      return;
-    }
-    toast("Notifications on. Keep this tab open in the background.");
-  }
-  state.settings.notify = e.target.checked;
+$("#lang-select").value = state.settings.lang;
+$("#lang-select").addEventListener("change", (e) => {
+  state.settings.lang = e.target.value;
   save();
+  if (listening) { stopListening(); startListening(); }
 });
 
-$("#check-interval").addEventListener("change", (e) => {
-  state.settings.checkMins = Number(e.target.value);
-  save();
-  startReminderLoop();
-});
-
-$("#export-btn").addEventListener("click", () => {
-  const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = "memora-export.json";
-  a.click();
-  URL.revokeObjectURL(a.href);
-});
-
-$("#import-btn").addEventListener("click", () => $("#import-file").click());
-$("#import-file").addEventListener("change", (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => {
-    try {
-      const data = JSON.parse(reader.result);
-      if (!data || !Array.isArray(data.items)) throw new Error("bad format");
-      const existing = new Set(state.items.map((it) => it.id));
-      let added = 0;
-      for (const it of data.items) {
-        if (it && it.id && it.q && it.a && !existing.has(it.id)) {
-          state.items.push({
-            id: it.id, q: String(it.q), a: String(it.a), tag: String(it.tag || ""),
-            createdAt: it.createdAt || Date.now(),
-            box: Math.min(Math.max(it.box || 0, 0), MAX_BOX),
-            due: it.due || Date.now(),
-            history: Array.isArray(it.history) ? it.history : [],
-          });
-          added++;
-        }
-      }
-      save();
-      renderItems();
-      updateDueBadge();
-      toast(`Imported ${added} item${added === 1 ? "" : "s"}.`);
-    } catch {
-      toast("Couldn't read that file — expected a Memora JSON export.");
-    }
-  };
-  reader.readAsText(file);
-  e.target.value = "";
-});
+if (!getRecognitionCtor()) {
+  $("#speech-support-warning").classList.remove("hidden");
+  $("#mic-btn").disabled = true;
+  $("#mic-btn").title = "Voice recognition isn't supported in this browser";
+}
 
 $("#wipe-btn").addEventListener("click", () => {
-  if (!confirm("Delete ALL items and history? This cannot be undone.")) return;
-  state = { items: [], settings: state.settings };
+  if (!confirm("Delete ALL saved counts? This cannot be undone.")) return;
+  state.history = [];
   save();
-  renderItems();
-  updateDueBadge();
-  toast("All data deleted.");
+  renderHistory();
+  toast("All saved counts deleted.");
 });
 
 // ---------- init ----------
 
-renderItems();
-updateDueBadge();
-startReminderLoop();
-checkReminders();
+renderCount();
 
 })();
